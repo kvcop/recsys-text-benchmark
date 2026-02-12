@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/raw/
+data/processed/
+data_hostgpu/
+results/
+.tmp_*.log
+.tmp_*.txt
