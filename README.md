@@ -138,9 +138,11 @@ recsys-text-benchmark/
 
 ## Быстрый запуск
 
+Для воспроизводимости используйте замороженные зависимости из lock-файла.
+
 ```bash
 cd ~/code/mine/recsys-text-benchmark
-uv sync
+uv sync --frozen
 ```
 
 ### Вариант A: локальный Ollama
@@ -164,27 +166,27 @@ docker run -d --gpus all -p 11435:11434 \
 Только TF-IDF:
 
 ```bash
-uv run recsys-bench --mode tfidf --max-impressions 3000 --seed 42
+uv run --frozen recsys-bench --mode tfidf --max-impressions 3000 --seed 42
 ```
 
 Embeddings через локальный Ollama:
 
 ```bash
-uv run recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
+uv run --frozen recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
   --ollama-model nomic-embed-text:latest --ollama-base-url http://127.0.0.1:11434
 ```
 
 Embeddings через Docker Ollama:
 
 ```bash
-uv run recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
+uv run --frozen recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
   --ollama-model nomic-embed-text:latest --ollama-base-url http://127.0.0.1:11435
 ```
 
 Оба режима сразу:
 
 ```bash
-uv run recsys-bench --mode both --max-impressions 1000 --seed 42
+uv run --frozen recsys-bench --mode both --max-impressions 1000 --seed 42
 ```
 
 ## Что смотреть в выводе
