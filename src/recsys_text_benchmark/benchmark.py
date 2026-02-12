@@ -18,7 +18,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from scipy import sparse
@@ -28,9 +28,7 @@ from tqdm import tqdm
 MIND_SMALL_TRAIN_URL = (
     "https://huggingface.co/datasets/yjw1029/MIND/resolve/main/MINDsmall_train.zip"
 )
-MIND_SMALL_DEV_URL = (
-    "https://huggingface.co/datasets/yjw1029/MIND/resolve/main/MINDsmall_dev.zip"
-)
+MIND_SMALL_DEV_URL = "https://huggingface.co/datasets/yjw1029/MIND/resolve/main/MINDsmall_dev.zip"
 
 
 @dataclass
@@ -114,9 +112,7 @@ def download_file(url: str, dst_path: Path) -> None:
 
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=120) as response, dst_path.open(
-        "wb"
-    ) as output:
+    with urllib.request.urlopen(request, timeout=120) as response, dst_path.open("wb") as output:
         total = int(response.headers.get("Content-Length", "0") or 0)
         progress = tqdm(
             total=total if total > 0 else None,
@@ -158,9 +154,7 @@ def resolve_mind_split_dir(base_dir: Path) -> Path:
         if (news_file.parent / "behaviors.tsv").exists()
     )
     if not candidates:
-        raise FileNotFoundError(
-            f"Не найдены news.tsv/behaviors.tsv в {base_dir}"
-        )
+        raise FileNotFoundError(f"Не найдены news.tsv/behaviors.tsv в {base_dir}")
     return candidates[0]
 
 
@@ -444,7 +438,10 @@ class OllamaClient:
         request = urllib.request.Request(url=url, data=data, headers=headers)
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             raw = response.read().decode("utf-8")
-            return json.loads(raw)
+            response_json = json.loads(raw)
+            if not isinstance(response_json, dict):
+                raise TypeError("Ollama API вернул неожиданный JSON-формат.")
+            return cast(dict[str, Any], response_json)
 
     def check_health(self) -> None:
         """Проверить доступность Ollama перед массовыми embed-запросами."""
@@ -487,7 +484,7 @@ def l2_normalize_rows(vectors: np.ndarray) -> np.ndarray:
 
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    return vectors / norms
+    return np.asarray(vectors / norms, dtype=np.float32)
 
 
 def build_embedding_matrix(
