@@ -9,6 +9,13 @@
 Цель проекта: не «доказать, что один метод всегда лучше», а дать практичную методику
 и артефакты, чтобы принять инженерное решение по качеству, задержке и стоимости.
 
+## Контекст дискуссии
+
+Этот репозиторий вырос из обсуждения идеи «взять тот же ранжировщик, но заменить
+`TF-IDF` на embeddings». Оригинальный контекст на Habr:
+
+- https://habr.com/ru/articles/990386/
+
 ## Что внутри и зачем
 
 Скрипт бенчмарка (`src/recsys_text_benchmark/benchmark.py`) делает честный A/B:
@@ -17,6 +24,9 @@
 2. Меняет только тип текстовых признаков.
 3. Считает ranking-метрики и time-метрики.
 4. Разделяет cold-start и warm-кейс через кэш эмбеддингов.
+5. Поддерживает два ранжировщика:
+   - `similarity` (исторический baseline),
+   - `svm` (`LinearSVC`, чтобы аутентично проверить гипотезу «тот же SVM на других фичах»).
 
 ## Датасет и продуктовый контекст
 
@@ -65,17 +75,21 @@
 
 ## Методика оценки
 
-Фиксируем всё, кроме фичей:
+Фиксируем всё, кроме фичей и выбранного ранжировщика:
 
 1. Одинаковые impressions.
-2. Одинаковая формула скоринга.
+2. Одинаковый train/dev сэмпл.
 3. Одинаковая агрегация пользовательского профиля.
 
-Детали скоринга:
+Поддерживаем два режима ранжирования:
 
-1. Профиль пользователя: средний вектор по истории кликов.
-2. Score кандидата: cosine/dot similarity профиля и кандидата.
-3. Отличается только источник векторов: `TF-IDF` или `embeddings`.
+1. `similarity`
+   - профиль пользователя: средний вектор по истории;
+   - score кандидата: `dot/cosine` с профилем.
+2. `svm`
+   - обучаем `LinearSVC` на train impressions;
+   - признак пары `(user, item)`: `item_vector - user_profile_vector`;
+   - score кандидата: `decision_function` модели.
 
 Метрики качества:
 
@@ -86,8 +100,9 @@
 Метрики времени:
 
 1. `feature_time_sec`: время подготовки признаков за весь прогон.
-2. `eval_time_sec`: время ранжирования за все impressions.
-3. `total_time_sec`: сумма.
+2. `train_time_sec` (для SVM): построение train выборки + обучение.
+3. `eval_time_sec`: время ранжирования за все impressions.
+4. `total_time_sec`: сумма.
 
 Важно: это время **за весь прогон**, не за один API-запрос.
 
@@ -109,6 +124,28 @@
 1. Эмбеддинги дают лучшее ранжирование.
 2. Для production их выгодно использовать с offline precompute и кэшированием item-векторов.
 3. TF-IDF стоит держать как baseline/fallback и быстрый старт.
+
+## SVM-результаты (LinearSVC, свежий прогон)
+
+Конфигурация прогона:
+
+1. `ranker=svm`
+2. `max-impressions=300` (dev)
+3. `svm-train-impressions=3000` (train)
+4. `svm-max-samples=60000`
+5. `model=nomic-embed-text:latest`
+
+Результат (`TF-IDF+SVM` vs `Embeddings+SVM`):
+
+1. `MRR`: `0.3282 -> 0.3513` (`+7.0%`)
+2. `NDCG@10`: `0.3627 -> 0.3835` (`+5.7%`)
+3. `Recall@10`: `0.5862 -> 0.6089` (`+3.9%`)
+
+Времена того же прогона:
+
+1. `TF-IDF+SVM total_time_sec`: `32.048s`
+2. `Embeddings+SVM total_time_sec`: `80.805s`
+3. Где узкое место для embeddings: `feature_time_sec` (построение эмбеддингов), а не `eval_time_sec`.
 
 ## Рекомендуемая архитектура для сервиса
 
@@ -163,37 +200,48 @@ docker run -d --gpus all -p 11435:11434 \
 
 ## Запуски экспериментов
 
-Только TF-IDF:
+Только TF-IDF + similarity baseline:
 
 ```bash
-uv run --frozen recsys-bench --mode tfidf --max-impressions 3000 --seed 42
+uv run --frozen recsys-bench --mode tfidf --ranker similarity --max-impressions 3000 --seed 42
 ```
 
-Embeddings через локальный Ollama:
+Только TF-IDF + SVM:
 
 ```bash
-uv run --frozen recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
+uv run --frozen recsys-bench --mode tfidf --ranker svm --max-impressions 300 --seed 42 \
+  --svm-train-impressions 3000 --svm-max-samples 60000
+```
+
+Embeddings + SVM через локальный Ollama:
+
+```bash
+uv run --frozen recsys-bench --mode embeddings --ranker svm --max-impressions 300 --seed 42 \
+  --svm-train-impressions 3000 --svm-max-samples 60000 \
   --ollama-model nomic-embed-text:latest --ollama-base-url http://127.0.0.1:11434
 ```
 
-Embeddings через Docker Ollama:
+Embeddings + SVM через Docker Ollama:
 
 ```bash
-uv run --frozen recsys-bench --mode embeddings --max-impressions 50 --seed 42 \
+uv run --frozen recsys-bench --mode embeddings --ranker svm --max-impressions 300 --seed 42 \
+  --svm-train-impressions 3000 --svm-max-samples 60000 \
   --ollama-model nomic-embed-text:latest --ollama-base-url http://127.0.0.1:11435
 ```
 
-Оба режима сразу:
+Оба типа фич + SVM за один запуск:
 
 ```bash
-uv run --frozen recsys-bench --mode both --max-impressions 1000 --seed 42
+uv run --frozen recsys-bench --mode both --ranker svm --max-impressions 300 --seed 42 \
+  --svm-train-impressions 3000 --svm-max-samples 60000
 ```
 
 ## Что смотреть в выводе
 
 1. `results/summary*.json`:
    - `dataset` (что именно было оценено),
-   - `results.tfidf` / `results.embeddings`,
+   - `results.tfidf` / `results.embeddings` (similarity),
+   - `results.tfidf_svm` / `results.embeddings_svm` (SVM),
    - метрики качества и времени.
 2. `loaded_from_cache`:
    - `false` означает cold-start;

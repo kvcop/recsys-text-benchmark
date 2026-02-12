@@ -23,6 +23,7 @@ from typing import Any, cast
 import numpy as np
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC
 from tqdm import tqdm
 
 MIND_SMALL_TRAIN_URL = (
@@ -68,6 +69,12 @@ def parse_args() -> argparse.Namespace:
         help="What to run.",
     )
     parser.add_argument(
+        "--ranker",
+        default="similarity",
+        choices=["similarity", "svm", "both"],
+        help="What ranking model to evaluate.",
+    )
+    parser.add_argument(
         "--max-impressions",
         type=int,
         default=4000,
@@ -89,6 +96,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ollama-model", default="nomic-embed-text")
     parser.add_argument("--ollama-batch-size", type=int, default=32)
     parser.add_argument("--ollama-timeout-seconds", type=int, default=600)
+
+    parser.add_argument(
+        "--svm-train-impressions",
+        type=int,
+        default=10_000,
+        help="How many train impressions to sample for SVM training.",
+    )
+    parser.add_argument(
+        "--svm-max-samples",
+        type=int,
+        default=80_000,
+        help="Maximum number of train candidate rows for SVM.",
+    )
+    parser.add_argument(
+        "--svm-c",
+        type=float,
+        default=1.0,
+        help="Regularization parameter C for LinearSVC.",
+    )
+    parser.add_argument(
+        "--svm-max-iter",
+        type=int,
+        default=5000,
+        help="Maximum number of iterations for LinearSVC.",
+    )
 
     parser.add_argument(
         "--output-json",
@@ -361,27 +393,57 @@ def aggregate_metrics(items: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(np.mean([item[key] for item in items])) for key in keys}
 
 
+def build_user_profile_tfidf(
+    tfidf_matrix: sparse.csr_matrix,
+    history_indices: np.ndarray,
+    normalize: bool,
+) -> sparse.csr_matrix:
+    """Построить вектор профиля пользователя по истории кликов."""
+
+    user_vector = tfidf_matrix[int(history_indices[0])].copy()
+    for idx in history_indices[1:]:
+        user_vector += tfidf_matrix[int(idx)]
+    user_vector = user_vector.multiply(1.0 / len(history_indices))
+    if normalize:
+        norm_sq = float(user_vector.multiply(user_vector).sum())
+        if norm_sq > 0:
+            user_vector = user_vector.multiply(1.0 / math.sqrt(norm_sq))
+    return user_vector.tocsr()
+
+
+def build_user_profile_embeddings(
+    embeddings: np.ndarray,
+    history_indices: np.ndarray,
+    normalize: bool,
+) -> np.ndarray:
+    """Построить dense-профиль пользователя по истории кликов."""
+
+    user_vector = embeddings[history_indices].mean(axis=0)
+    if normalize:
+        norm = float(np.linalg.norm(user_vector))
+        if norm > 0:
+            user_vector = user_vector / norm
+    return np.asarray(user_vector, dtype=np.float32)
+
+
 def evaluate_with_tfidf(
     tfidf_matrix: sparse.csr_matrix,
     eval_impressions: list[EvalImpression],
 ) -> tuple[dict[str, float], float, int]:
-    """Оценить качество и скорость ранжирования с TF-IDF признаками."""
+    """Оценить качество и скорость similarity-ранжирования с TF-IDF."""
 
     metrics: list[dict[str, float]] = []
     start = time.perf_counter()
 
     for impression in tqdm(eval_impressions, desc="eval:tfidf"):
-        history = impression.history_indices
-        # Профиль пользователя: средний вектор по истории кликов.
-        user_vector = tfidf_matrix[int(history[0])].copy()
-        for idx in history[1:]:
-            user_vector += tfidf_matrix[int(idx)]
-        user_vector = user_vector.multiply(1.0 / len(history))
-
+        user_vector = build_user_profile_tfidf(
+            tfidf_matrix=tfidf_matrix,
+            history_indices=impression.history_indices,
+            normalize=True,
+        )
         norm_sq = float(user_vector.multiply(user_vector).sum())
         if norm_sq <= 0:
             continue
-        user_vector = user_vector.multiply(1.0 / math.sqrt(norm_sq))
 
         candidate_matrix = tfidf_matrix[impression.candidate_indices]
         scores = (candidate_matrix @ user_vector.T).toarray().ravel()
@@ -395,18 +457,20 @@ def evaluate_with_embeddings(
     embeddings: np.ndarray,
     eval_impressions: list[EvalImpression],
 ) -> tuple[dict[str, float], float, int]:
-    """Оценить качество и скорость ранжирования с embedding-признаками."""
+    """Оценить качество и скорость similarity-ранжирования с embeddings."""
 
     metrics: list[dict[str, float]] = []
     start = time.perf_counter()
 
     for impression in tqdm(eval_impressions, desc="eval:embeddings"):
-        history_vectors = embeddings[impression.history_indices]
-        user_vector = history_vectors.mean(axis=0)
+        user_vector = build_user_profile_embeddings(
+            embeddings=embeddings,
+            history_indices=impression.history_indices,
+            normalize=True,
+        )
         norm = float(np.linalg.norm(user_vector))
         if norm <= 0:
             continue
-        user_vector = user_vector / norm
 
         candidate_vectors = embeddings[impression.candidate_indices]
         scores = candidate_vectors @ user_vector
@@ -414,6 +478,210 @@ def evaluate_with_embeddings(
 
     elapsed = time.perf_counter() - start
     return aggregate_metrics(metrics), elapsed, len(metrics)
+
+
+def build_svm_dataset_tfidf(
+    tfidf_matrix: sparse.csr_matrix,
+    train_impressions: list[EvalImpression],
+    max_samples: int,
+    seed: int,
+) -> tuple[sparse.csr_matrix, np.ndarray]:
+    """Подготовить обучающие признаки для LinearSVC из TF-IDF."""
+
+    if max_samples <= 0:
+        raise ValueError("svm_max_samples должен быть > 0")
+
+    chunks: list[sparse.csr_matrix] = []
+    targets: list[np.ndarray] = []
+    collected = 0
+
+    order = np.random.default_rng(seed).permutation(len(train_impressions))
+    for position in tqdm(order, desc="svm-dataset:tfidf"):
+        impression = train_impressions[int(position)]
+        user_vector = build_user_profile_tfidf(
+            tfidf_matrix=tfidf_matrix,
+            history_indices=impression.history_indices,
+            normalize=False,
+        )
+        candidate_matrix = tfidf_matrix[impression.candidate_indices]
+        repeated_user = sparse.vstack([user_vector] * int(candidate_matrix.shape[0]), format="csr")
+        features = candidate_matrix - repeated_user
+        labels = impression.labels.astype(np.int32, copy=False)
+
+        take = min(int(features.shape[0]), max_samples - collected)
+        if take <= 0:
+            break
+
+        if take < int(features.shape[0]):
+            features = features[:take]
+            labels = labels[:take]
+
+        chunks.append(features.tocsr())
+        targets.append(labels)
+        collected += take
+        if collected >= max_samples:
+            break
+
+    if not chunks:
+        raise RuntimeError("Не удалось собрать train-выборку для SVM (TF-IDF).")
+
+    x_train = sparse.vstack(chunks, format="csr")
+    y_train = np.concatenate(targets).astype(np.int32, copy=False)
+    if np.unique(y_train).size < 2:
+        raise RuntimeError("В train-выборке SVM только один класс (TF-IDF).")
+    return x_train, y_train
+
+
+def build_svm_dataset_embeddings(
+    embeddings: np.ndarray,
+    train_impressions: list[EvalImpression],
+    max_samples: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Подготовить обучающие признаки для LinearSVC из embeddings."""
+
+    if max_samples <= 0:
+        raise ValueError("svm_max_samples должен быть > 0")
+
+    chunks: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    collected = 0
+
+    order = np.random.default_rng(seed).permutation(len(train_impressions))
+    for position in tqdm(order, desc="svm-dataset:emb"):
+        impression = train_impressions[int(position)]
+        user_vector = build_user_profile_embeddings(
+            embeddings=embeddings,
+            history_indices=impression.history_indices,
+            normalize=False,
+        )
+        candidate_vectors = embeddings[impression.candidate_indices]
+        features = np.asarray(candidate_vectors - user_vector, dtype=np.float32)
+        labels = impression.labels.astype(np.int32, copy=False)
+
+        take = min(int(features.shape[0]), max_samples - collected)
+        if take <= 0:
+            break
+
+        if take < int(features.shape[0]):
+            features = features[:take]
+            labels = labels[:take]
+
+        chunks.append(features)
+        targets.append(labels)
+        collected += take
+        if collected >= max_samples:
+            break
+
+    if not chunks:
+        raise RuntimeError("Не удалось собрать train-выборку для SVM (embeddings).")
+
+    x_train = np.vstack(chunks).astype(np.float32)
+    y_train = np.concatenate(targets).astype(np.int32, copy=False)
+    if np.unique(y_train).size < 2:
+        raise RuntimeError("В train-выборке SVM только один класс (embeddings).")
+    return x_train, y_train
+
+
+def evaluate_with_svm_tfidf(
+    tfidf_matrix: sparse.csr_matrix,
+    train_impressions: list[EvalImpression],
+    eval_impressions: list[EvalImpression],
+    max_samples: int,
+    seed: int,
+    svm_c: float,
+    svm_max_iter: int,
+) -> tuple[dict[str, float], float, float, int, int]:
+    """Обучить и оценить LinearSVC на TF-IDF признаках."""
+
+    train_start = time.perf_counter()
+    x_train, y_train = build_svm_dataset_tfidf(
+        tfidf_matrix=tfidf_matrix,
+        train_impressions=train_impressions,
+        max_samples=max_samples,
+        seed=seed,
+    )
+    model = LinearSVC(
+        C=svm_c,
+        max_iter=svm_max_iter,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    model.fit(x_train, y_train)
+    train_elapsed = time.perf_counter() - train_start
+
+    metrics: list[dict[str, float]] = []
+    eval_start = time.perf_counter()
+    for impression in tqdm(eval_impressions, desc="eval:tfidf_svm"):
+        user_vector = build_user_profile_tfidf(
+            tfidf_matrix=tfidf_matrix,
+            history_indices=impression.history_indices,
+            normalize=False,
+        )
+        candidate_matrix = tfidf_matrix[impression.candidate_indices]
+        repeated_user = sparse.vstack([user_vector] * int(candidate_matrix.shape[0]), format="csr")
+        features = candidate_matrix - repeated_user
+        scores = np.asarray(model.decision_function(features), dtype=np.float32).ravel()
+        metrics.append(compute_metrics(scores=scores, labels=impression.labels))
+    eval_elapsed = time.perf_counter() - eval_start
+
+    return (
+        aggregate_metrics(metrics),
+        train_elapsed,
+        eval_elapsed,
+        int(x_train.shape[0]),
+        len(metrics),
+    )
+
+
+def evaluate_with_svm_embeddings(
+    embeddings: np.ndarray,
+    train_impressions: list[EvalImpression],
+    eval_impressions: list[EvalImpression],
+    max_samples: int,
+    seed: int,
+    svm_c: float,
+    svm_max_iter: int,
+) -> tuple[dict[str, float], float, float, int, int]:
+    """Обучить и оценить LinearSVC на embedding-признаках."""
+
+    train_start = time.perf_counter()
+    x_train, y_train = build_svm_dataset_embeddings(
+        embeddings=embeddings,
+        train_impressions=train_impressions,
+        max_samples=max_samples,
+        seed=seed,
+    )
+    model = LinearSVC(
+        C=svm_c,
+        max_iter=svm_max_iter,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    model.fit(x_train, y_train)
+    train_elapsed = time.perf_counter() - train_start
+
+    metrics: list[dict[str, float]] = []
+    eval_start = time.perf_counter()
+    for impression in tqdm(eval_impressions, desc="eval:emb_svm"):
+        user_vector = build_user_profile_embeddings(
+            embeddings=embeddings,
+            history_indices=impression.history_indices,
+            normalize=False,
+        )
+        candidate_vectors = embeddings[impression.candidate_indices]
+        features = np.asarray(candidate_vectors - user_vector, dtype=np.float32)
+        scores = np.asarray(model.decision_function(features), dtype=np.float32).ravel()
+        metrics.append(compute_metrics(scores=scores, labels=impression.labels))
+    eval_elapsed = time.perf_counter() - eval_start
+
+    return (
+        aggregate_metrics(metrics),
+        train_elapsed,
+        eval_elapsed,
+        int(x_train.shape[0]),
+        len(metrics),
+    )
 
 
 class OllamaClient:
@@ -536,8 +804,12 @@ def print_results(results: dict[str, dict[str, Any]]) -> None:
         metrics = payload["metrics"]
         print(f"\n[{name}]")
         print(f"  feature_time_sec: {payload['feature_time_sec']:.3f}")
+        if "train_time_sec" in payload:
+            print(f"  train_time_sec:   {payload['train_time_sec']:.3f}")
         print(f"  eval_time_sec:    {payload['eval_time_sec']:.3f}")
         print(f"  total_time_sec:   {payload['total_time_sec']:.3f}")
+        if "train_samples" in payload:
+            print(f"  train_samples:    {payload['train_samples']}")
         print(f"  evaluated_impr:   {payload['evaluated_impressions']}")
         print(
             "  metrics:"
@@ -560,17 +832,31 @@ def main() -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     train_dir, dev_dir = ensure_mind_small(data_dir)
-    raw_impressions = load_raw_impressions(
+
+    raw_dev_impressions = load_raw_impressions(
         behaviors_path=dev_dir / "behaviors.tsv",
         max_impressions=args.max_impressions,
         seed=args.seed,
     )
-    if not raw_impressions:
-        raise RuntimeError("Не удалось подготовить impressions для оценки.")
+    if not raw_dev_impressions:
+        raise RuntimeError("Не удалось подготовить dev impressions для оценки.")
+
+    raw_train_impressions: list[RawImpression] = []
+    if args.ranker in {"svm", "both"}:
+        raw_train_impressions = load_raw_impressions(
+            behaviors_path=train_dir / "behaviors.tsv",
+            max_impressions=args.svm_train_impressions,
+            seed=args.seed + 1,
+        )
+        if not raw_train_impressions:
+            raise RuntimeError("Не удалось подготовить train impressions для SVM.")
 
     # Ограничиваем корпус только новостями, которые реально встречаются в выборке.
     needed_ids: set[str] = set()
-    for impression in raw_impressions:
+    for impression in raw_dev_impressions:
+        needed_ids.update(impression.history_ids)
+        needed_ids.update(impression.candidate_ids)
+    for impression in raw_train_impressions:
         needed_ids.update(impression.history_ids)
         needed_ids.update(impression.candidate_ids)
 
@@ -585,31 +871,51 @@ def main() -> None:
     text_corpus = [news_texts[news_id] for news_id in news_ids]
     news_to_index = {news_id: idx for idx, news_id in enumerate(news_ids)}
 
-    eval_impressions, dropped = build_eval_impressions(
-        raw_impressions=raw_impressions,
+    eval_impressions, dropped_dev = build_eval_impressions(
+        raw_impressions=raw_dev_impressions,
         news_to_index=news_to_index,
         max_history=args.max_history,
     )
     if not eval_impressions:
-        raise RuntimeError("После фильтрации не осталось impressions для оценки.")
+        raise RuntimeError("После фильтрации не осталось dev impressions для оценки.")
+
+    train_impressions_for_svm: list[EvalImpression] = []
+    dropped_train = 0
+    if args.ranker in {"svm", "both"}:
+        train_impressions_for_svm, dropped_train = build_eval_impressions(
+            raw_impressions=raw_train_impressions,
+            news_to_index=news_to_index,
+            max_history=args.max_history,
+        )
+        if not train_impressions_for_svm:
+            raise RuntimeError("После фильтрации не осталось train impressions для SVM.")
 
     print(
         "dataset:"
-        f" raw_impressions={len(raw_impressions)}"
-        f" eval_impressions={len(eval_impressions)}"
-        f" dropped={dropped}"
+        f" raw_dev_impressions={len(raw_dev_impressions)}"
+        f" eval_dev_impressions={len(eval_impressions)}"
+        f" dropped_dev={dropped_dev}"
+        f" raw_train_impressions={len(raw_train_impressions)}"
+        f" eval_train_impressions={len(train_impressions_for_svm)}"
+        f" dropped_train={dropped_train}"
         f" unique_news={len(news_ids)}"
     )
 
     summary: dict[str, Any] = {
         "dataset": {
             "name": "MINDsmall_dev",
-            "raw_impressions": len(raw_impressions),
+            "ranker": args.ranker,
+            "raw_impressions": len(raw_dev_impressions),
             "eval_impressions": len(eval_impressions),
-            "dropped_impressions": dropped,
+            "dropped_impressions": dropped_dev,
+            "raw_train_impressions": len(raw_train_impressions),
+            "train_impressions": len(train_impressions_for_svm),
+            "dropped_train_impressions": dropped_train,
             "unique_news": len(news_ids),
             "max_history": args.max_history,
             "max_impressions": args.max_impressions,
+            "svm_train_impressions": args.svm_train_impressions,
+            "svm_max_samples": args.svm_max_samples,
             "seed": args.seed,
         },
         "results": {},
@@ -629,19 +935,45 @@ def main() -> None:
         tfidf_matrix = vectorizer.fit_transform(text_corpus).tocsr().astype(np.float32)
         feature_time = time.perf_counter() - feature_start
 
-        metrics, eval_time, evaluated = evaluate_with_tfidf(
-            tfidf_matrix=tfidf_matrix,
-            eval_impressions=eval_impressions,
-        )
-        results["tfidf"] = {
-            "feature_time_sec": feature_time,
-            "eval_time_sec": eval_time,
-            "total_time_sec": feature_time + eval_time,
-            "evaluated_impressions": evaluated,
-            "vocab_size": len(vectorizer.vocabulary_),
-            "metrics": metrics,
-        }
-        summary["results"]["tfidf"] = results["tfidf"]
+        if args.ranker in {"similarity", "both"}:
+            metrics, eval_time, evaluated = evaluate_with_tfidf(
+                tfidf_matrix=tfidf_matrix,
+                eval_impressions=eval_impressions,
+            )
+            results["tfidf"] = {
+                "feature_time_sec": feature_time,
+                "eval_time_sec": eval_time,
+                "total_time_sec": feature_time + eval_time,
+                "evaluated_impressions": evaluated,
+                "vocab_size": len(vectorizer.vocabulary_),
+                "ranker": "similarity",
+                "metrics": metrics,
+            }
+            summary["results"]["tfidf"] = results["tfidf"]
+
+        if args.ranker in {"svm", "both"}:
+            metrics, train_time, eval_time, train_samples, evaluated = evaluate_with_svm_tfidf(
+                tfidf_matrix=tfidf_matrix,
+                train_impressions=train_impressions_for_svm,
+                eval_impressions=eval_impressions,
+                max_samples=args.svm_max_samples,
+                seed=args.seed,
+                svm_c=args.svm_c,
+                svm_max_iter=args.svm_max_iter,
+            )
+            results["tfidf_svm"] = {
+                "feature_time_sec": feature_time,
+                "train_time_sec": train_time,
+                "eval_time_sec": eval_time,
+                "total_time_sec": feature_time + train_time + eval_time,
+                "train_samples": train_samples,
+                "evaluated_impressions": evaluated,
+                "vocab_size": len(vectorizer.vocabulary_),
+                "ranker": "linear_svm",
+                "svm_c": args.svm_c,
+                "metrics": metrics,
+            }
+            summary["results"]["tfidf_svm"] = results["tfidf_svm"]
 
     if args.mode in {"both", "embeddings"}:
         # Отдельно меряем стоимость построения embeddings (cold/warm по кэшу).
@@ -657,22 +989,53 @@ def main() -> None:
         )
         feature_time = time.perf_counter() - feature_start
 
-        metrics, eval_time, evaluated = evaluate_with_embeddings(
-            embeddings=embeddings,
-            eval_impressions=eval_impressions,
-        )
-        results["embeddings"] = {
-            "feature_time_sec": feature_time,
-            "eval_time_sec": eval_time,
-            "total_time_sec": feature_time + eval_time,
-            "evaluated_impressions": evaluated,
-            "embedding_model": args.ollama_model,
-            "embedding_dim": int(embeddings.shape[1]),
-            "cache_path": str(cache_path),
-            "loaded_from_cache": loaded_from_cache,
-            "metrics": metrics,
-        }
-        summary["results"]["embeddings"] = results["embeddings"]
+        if args.ranker in {"similarity", "both"}:
+            metrics, eval_time, evaluated = evaluate_with_embeddings(
+                embeddings=embeddings,
+                eval_impressions=eval_impressions,
+            )
+            results["embeddings"] = {
+                "feature_time_sec": feature_time,
+                "eval_time_sec": eval_time,
+                "total_time_sec": feature_time + eval_time,
+                "evaluated_impressions": evaluated,
+                "embedding_model": args.ollama_model,
+                "embedding_dim": int(embeddings.shape[1]),
+                "cache_path": str(cache_path),
+                "loaded_from_cache": loaded_from_cache,
+                "ranker": "similarity",
+                "metrics": metrics,
+            }
+            summary["results"]["embeddings"] = results["embeddings"]
+
+        if args.ranker in {"svm", "both"}:
+            metrics, train_time, eval_time, train_samples, evaluated = (
+                evaluate_with_svm_embeddings(
+                    embeddings=embeddings,
+                    train_impressions=train_impressions_for_svm,
+                    eval_impressions=eval_impressions,
+                    max_samples=args.svm_max_samples,
+                    seed=args.seed,
+                    svm_c=args.svm_c,
+                    svm_max_iter=args.svm_max_iter,
+                )
+            )
+            results["embeddings_svm"] = {
+                "feature_time_sec": feature_time,
+                "train_time_sec": train_time,
+                "eval_time_sec": eval_time,
+                "total_time_sec": feature_time + train_time + eval_time,
+                "train_samples": train_samples,
+                "evaluated_impressions": evaluated,
+                "embedding_model": args.ollama_model,
+                "embedding_dim": int(embeddings.shape[1]),
+                "cache_path": str(cache_path),
+                "loaded_from_cache": loaded_from_cache,
+                "ranker": "linear_svm",
+                "svm_c": args.svm_c,
+                "metrics": metrics,
+            }
+            summary["results"]["embeddings_svm"] = results["embeddings_svm"]
 
     print_results(results)
 
